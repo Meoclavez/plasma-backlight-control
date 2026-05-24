@@ -108,8 +108,8 @@ def on_new_sample(appsink):
     global last_color_time
     now = time.time()
     
-    # Cap at ~20 FPS for smoothness without overwhelming asusctl
-    if now - last_color_time < 0.05: 
+    # Cap at ~60 FPS for buttery smoothness now that D-Bus has zero overhead
+    if now - last_color_time < 0.016: 
         return Gst.FlowReturn.OK
         
     sample = appsink.emit('pull-sample')
