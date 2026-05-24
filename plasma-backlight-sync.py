@@ -131,30 +131,45 @@ def get_highlight_color(image_path):
                 closest_pixel = p[0:3]
                 
         # 5. Generate the matching vibrant/dominant color from the bright parts of the screen
+        # We quantize all bright pixels to calculate the area (size) of each color
+        AREA_BIN_SIZE = 24
+        bin_counts = Counter()
+        for r, g, b, h, l, s in bright_pixels:
+            qr = (r // AREA_BIN_SIZE) * AREA_BIN_SIZE
+            qg = (g // AREA_BIN_SIZE) * AREA_BIN_SIZE
+            qb = (b // AREA_BIN_SIZE) * AREA_BIN_SIZE
+            bin_counts[(qr, qg, qb)] += 1
+            
+        # Score each pixel by combining its saturation, brightness, and its color area count
         scored_pixels = []
         for r, g, b, h, l, s in bright_pixels:
-            # Score highly for high saturation and moderate brightness
             brightness_factor = 1.0 - abs(l - 0.5) * 2.0
             brightness_factor = max(0.0, brightness_factor)
-            score = s * brightness_factor
+            
+            qr = (r // AREA_BIN_SIZE) * AREA_BIN_SIZE
+            qg = (g // AREA_BIN_SIZE) * AREA_BIN_SIZE
+            qb = (b // AREA_BIN_SIZE) * AREA_BIN_SIZE
+            area_factor = (bin_counts[(qr, qg, qb)] / len(bright_pixels)) ** 0.5
+            
+            score = s * brightness_factor * area_factor
             scored_pixels.append((score, r, g, b))
             
         scored_pixels.sort(key=lambda x: x[0], reverse=True)
         
-        # Filter to top vibrant pixels
-        top_vibrant = [(r, g, b) for score, r, g, b in scored_pixels if score > 0.15]
+        # Filter to top scored pixels (vibrancy combined with spatial size)
+        top_vibrant = [(r, g, b) for score, r, g, b in scored_pixels if score > 0.005]
         if not top_vibrant:
             vibrant_color = closest_pixel if closest_pixel else (0, 0, 0)
         else:
-            BIN_SIZE = 32
-            quantized = [ (r//BIN_SIZE*BIN_SIZE, g//BIN_SIZE*BIN_SIZE, b//BIN_SIZE*BIN_SIZE) for r, g, b in top_vibrant[:100] ]
+            CLUSTER_BIN_SIZE = 32
+            quantized = [ (r//CLUSTER_BIN_SIZE*CLUSTER_BIN_SIZE, g//CLUSTER_BIN_SIZE*CLUSTER_BIN_SIZE, b//CLUSTER_BIN_SIZE*CLUSTER_BIN_SIZE) for r, g, b in top_vibrant[:100] ]
             most_common = Counter(quantized).most_common(1)[0][0]
             
             bin_r, bin_g, bin_b = most_common
             matching = [p for p in top_vibrant[:100] 
-                        if p[0]//BIN_SIZE*BIN_SIZE == bin_r and 
-                           p[1]//BIN_SIZE*BIN_SIZE == bin_g and 
-                           p[2]//BIN_SIZE*BIN_SIZE == bin_b]
+                        if p[0]//CLUSTER_BIN_SIZE*CLUSTER_BIN_SIZE == bin_r and 
+                           p[1]//CLUSTER_BIN_SIZE*CLUSTER_BIN_SIZE == bin_g and 
+                           p[2]//CLUSTER_BIN_SIZE*CLUSTER_BIN_SIZE == bin_b]
             
             if matching:
                 avg_v_r = sum(p[0] for p in matching) // len(matching)
