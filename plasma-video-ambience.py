@@ -201,7 +201,7 @@ def on_new_sample(appsink):
                 qb = (b // AREA_BIN_SIZE) * AREA_BIN_SIZE
                 area_factor = (bin_counts[(qr, qg, qb)] / len(bright_pixels)) ** 0.5
                 
-                score = s * brightness_factor * area_factor
+                score = (s ** 1.5) * brightness_factor * (area_factor ** 0.5)
                 scored_pixels.append((score, r, g, b))
                 
             scored_pixels.sort(key=lambda x: x[0], reverse=True)
