@@ -108,177 +108,186 @@ def on_new_sample(appsink):
     global last_color_time
     now = time.time()
     
-    # Cap at ~60 FPS for buttery smoothness now that D-Bus has zero overhead
+    # 1. ALWAYS pull the sample first to drain GStreamer's queue and prevent memory accumulation
+    sample = appsink.emit('pull-sample')
+    if not sample:
+        return Gst.FlowReturn.OK
+        
+    # 2. Apply the FPS cap check after pulling to safely discard frames
     if now - last_color_time < 0.016: 
         return Gst.FlowReturn.OK
         
-    sample = appsink.emit('pull-sample')
     buf = sample.get_buffer()
-    
     success, map_info = buf.map(Gst.MapFlags.READ)
     if success:
-        data = map_info.data
-        pixels = []
-        for i in range(0, len(data), 3):
-            pixels.append((data[i], data[i+1], data[i+2]))
-            
-        def rgb_dist(p1, p2):
-            return ((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2 + (p1[2] - p2[2])**2)**0.5
-
-        # 1. Convert all pixels to HSL to perform brightness-aware analysis
-        pixels_hls = []
-        for r, g, b in pixels:
-            h, l, s = colorsys.rgb_to_hls(r/255.0, g/255.0, b/255.0)
-            pixels_hls.append((r, g, b, h, l, s))
-
-        # Calculate overall screen brightness (average lightness of all pixels)
-        screen_brightness = sum(p[4] for p in pixels_hls) / len(pixels_hls)
-
-        # 2. Filter out extremely dark/black pixels to avoid camera noise & compression artifacts
-        # dominating the average (e.g. preventing subtle dark red/blue tones from taking over)
-        bright_pixels = [p for p in pixels_hls if p[4] >= 0.08]
-        if not bright_pixels:
-            bright_pixels = pixels_hls  # Fallback if the whole screen is pitch black
-
-        # 3. Calculate a weighted average of the bright parts of the screen
-        # We weight each pixel by its lightness and square of saturation to emphasize highly vibrant elements
-        has_saturation = any(p[5] >= 0.15 for p in bright_pixels)
-        
-        total_weight = 0
-        weighted_r = 0.0
-        weighted_g = 0.0
-        weighted_b = 0.0
-        
-        for r, g, b, h, l, s in bright_pixels:
-            if has_saturation:
-                weight = l * (s ** 2.0)  # Emphasize highly saturated colors (e.g. pink nebulas)
-            else:
-                weight = l
-            weighted_r += r * weight
-            weighted_g += g * weight
-            weighted_b += b * weight
-            total_weight += weight
-            
-        if total_weight > 0:
-            avg_r = int(weighted_r / total_weight)
-            avg_g = int(weighted_g / total_weight)
-            avg_b = int(weighted_b / total_weight)
-        else:
-            avg_r, avg_g, avg_b = 0, 0, 0
-        avg_color = (avg_r, avg_g, avg_b)
-        
-        # 4. Check if the average color is in the bright screen area (min distance to actual pixels)
-        closest_pixel = None
-        min_dist = float('inf')
-        for p in bright_pixels:
-            d = rgb_dist(avg_color, p[0:3])
-            if d < min_dist:
-                min_dist = d
-                closest_pixel = p[0:3]
+        try:
+            data = map_info.data
+            pixels = []
+            for i in range(0, len(data), 3):
+                pixels.append((data[i], data[i+1], data[i+2]))
                 
-        # 5. Generate the matching vibrant/dominant color from the bright parts of the screen
-        # We quantize all bright pixels to calculate the area (size) of each color
-        AREA_BIN_SIZE = 24
-        bin_counts = Counter()
-        for r, g, b, h, l, s in bright_pixels:
-            qr = (r // AREA_BIN_SIZE) * AREA_BIN_SIZE
-            qg = (g // AREA_BIN_SIZE) * AREA_BIN_SIZE
-            qb = (b // AREA_BIN_SIZE) * AREA_BIN_SIZE
-            bin_counts[(qr, qg, qb)] += 1
+            def rgb_dist(p1, p2):
+                return ((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2 + (p1[2] - p2[2])**2)**0.5
+    
+            # 1. Convert all pixels to HSL to perform brightness-aware analysis
+            pixels_hls = []
+            for r, g, b in pixels:
+                h, l, s = colorsys.rgb_to_hls(r/255.0, g/255.0, b/255.0)
+                pixels_hls.append((r, g, b, h, l, s))
+    
+            # Calculate overall screen brightness (average lightness of all pixels)
+            screen_brightness = sum(p[4] for p in pixels_hls) / len(pixels_hls)
+    
+            # 2. Filter out extremely dark/black pixels to avoid camera noise & compression artifacts
+            # dominating the average (e.g. preventing subtle dark red/blue tones from taking over)
+            bright_pixels = [p for p in pixels_hls if p[4] >= 0.08]
+            if not bright_pixels:
+                bright_pixels = pixels_hls  # Fallback if the whole screen is pitch black
+    
+            # 3. Calculate a weighted average of the bright parts of the screen
+            # We weight each pixel by its lightness and square of saturation to emphasize highly vibrant elements
+            has_saturation = any(p[5] >= 0.15 for p in bright_pixels)
             
-        # Score each pixel by combining its saturation, brightness, and its color area count
-        scored_pixels = []
-        for r, g, b, h, l, s in bright_pixels:
-            brightness_factor = 1.0 - abs(l - 0.5) * 2.0
-            brightness_factor = max(0.0, brightness_factor)
+            total_weight = 0
+            weighted_r = 0.0
+            weighted_g = 0.0
+            weighted_b = 0.0
             
-            qr = (r // AREA_BIN_SIZE) * AREA_BIN_SIZE
-            qg = (g // AREA_BIN_SIZE) * AREA_BIN_SIZE
-            qb = (b // AREA_BIN_SIZE) * AREA_BIN_SIZE
-            area_factor = (bin_counts[(qr, qg, qb)] / len(bright_pixels)) ** 0.5
-            
-            score = s * brightness_factor * area_factor
-            scored_pixels.append((score, r, g, b))
-            
-        scored_pixels.sort(key=lambda x: x[0], reverse=True)
-        
-        # Filter to top scored pixels (vibrancy combined with spatial size)
-        top_vibrant = [(r, g, b) for score, r, g, b in scored_pixels if score > 0.005]
-        if not top_vibrant:
-            vibrant_color = closest_pixel if closest_pixel else (0, 0, 0)
-        else:
-            CLUSTER_BIN_SIZE = 32
-            quantized = [ (r//CLUSTER_BIN_SIZE*CLUSTER_BIN_SIZE, g//CLUSTER_BIN_SIZE*CLUSTER_BIN_SIZE, b//CLUSTER_BIN_SIZE*CLUSTER_BIN_SIZE) for r, g, b in top_vibrant[:100] ]
-            most_common = Counter(quantized).most_common(1)[0][0]
-            
-            bin_r, bin_g, bin_b = most_common
-            matching = [p for p in top_vibrant[:100] 
-                        if p[0]//CLUSTER_BIN_SIZE*CLUSTER_BIN_SIZE == bin_r and 
-                           p[1]//CLUSTER_BIN_SIZE*CLUSTER_BIN_SIZE == bin_g and 
-                           p[2]//CLUSTER_BIN_SIZE*CLUSTER_BIN_SIZE == bin_b]
-            
-            if matching:
-                avg_v_r = sum(p[0] for p in matching) // len(matching)
-                avg_v_g = sum(p[1] for p in matching) // len(matching)
-                avg_v_b = sum(p[2] for p in matching) // len(matching)
-                vibrant_color = (avg_v_r, avg_v_g, avg_v_b)
-            else:
-                vibrant_color = top_vibrant[0]
+            for r, g, b, h, l, s in bright_pixels:
+                if has_saturation:
+                    weight = l * (s ** 2.0)  # Emphasize highly saturated colors (e.g. pink nebulas)
+                else:
+                    weight = l
+                weighted_r += r * weight
+                weighted_g += g * weight
+                weighted_b += b * weight
+                total_weight += weight
                 
-        # 6. Smooth Blend Guard between Weighted Average and Vibrant Color:
-        # Instead of a hard switch, we calculate a continuous blend factor based on the saturation (avg_s)
-        # of the average color and its proximity to the real pixels (min_dist).
-        avg_h, avg_l, avg_s = colorsys.rgb_to_hls(avg_r/255.0, avg_g/255.0, avg_b/255.0)
-        
-        # Proximity confidence factor (snaps to vibrant if average color does not exist in screen)
-        if min_dist > 35.0:
-            proximity_factor = max(0.0, 1.0 - (min_dist - 35.0) / 35.0)
-        else:
-            proximity_factor = 1.0
+            if total_weight > 0:
+                avg_r = int(weighted_r / total_weight)
+                avg_g = int(weighted_g / total_weight)
+                avg_b = int(weighted_b / total_weight)
+            else:
+                avg_r, avg_g, avg_b = 0, 0, 0
+            avg_color = (avg_r, avg_g, avg_b)
             
-        # Overall confidence in using the average color
-        average_confidence = avg_s * proximity_factor
-        
-        # Smoothly interpolate blend based on confidence
-        if average_confidence <= 0.05:
-            blend = 0.0
-        elif average_confidence >= 0.18:
-            blend = 1.0
-        else:
-            blend = (average_confidence - 0.05) / (0.18 - 0.05)
+            # 4. Check if the average color is in the bright screen area (min distance to actual pixels)
+            closest_pixel = None
+            min_dist = float('inf')
+            for p in bright_pixels:
+                d = rgb_dist(avg_color, p[0:3])
+                if d < min_dist:
+                    min_dist = d
+                    closest_pixel = p[0:3]
+                    
+            # 5. Generate the matching vibrant/dominant color from the bright parts of the screen
+            # We quantize all bright pixels to calculate the area (size) of each color
+            AREA_BIN_SIZE = 24
+            bin_counts = Counter()
+            for r, g, b, h, l, s in bright_pixels:
+                qr = (r // AREA_BIN_SIZE) * AREA_BIN_SIZE
+                qg = (g // AREA_BIN_SIZE) * AREA_BIN_SIZE
+                qb = (b // AREA_BIN_SIZE) * AREA_BIN_SIZE
+                bin_counts[(qr, qg, qb)] += 1
+                
+            # Score each pixel by combining its saturation, brightness, and its color area count
+            scored_pixels = []
+            for r, g, b, h, l, s in bright_pixels:
+                brightness_factor = 1.0 - abs(l - 0.5) * 2.0
+                brightness_factor = max(0.0, brightness_factor)
+                
+                qr = (r // AREA_BIN_SIZE) * AREA_BIN_SIZE
+                qg = (g // AREA_BIN_SIZE) * AREA_BIN_SIZE
+                qb = (b // AREA_BIN_SIZE) * AREA_BIN_SIZE
+                area_factor = (bin_counts[(qr, qg, qb)] / len(bright_pixels)) ** 0.5
+                
+                score = s * brightness_factor * area_factor
+                scored_pixels.append((score, r, g, b))
+                
+            scored_pixels.sort(key=lambda x: x[0], reverse=True)
             
-        final_color = (
-            int(vibrant_color[0] * (1.0 - blend) + avg_color[0] * blend),
-            int(vibrant_color[1] * (1.0 - blend) + avg_color[1] * blend),
-            int(vibrant_color[2] * (1.0 - blend) + avg_color[2] * blend)
-        )
-        
-        # 7. Optimize color for keyboard backlight:
-        # Scale the overall target brightness (lightness) based on screen_brightness to prevent
-        # the keyboard from staying bright in dark scenes.
-        r_f, g_f, b_f = final_color[0]/255.0, final_color[1]/255.0, final_color[2]/255.0
-        h, l, s = colorsys.rgb_to_hls(r_f, g_f, b_f)
-        
-        original_s = s
-        
-        # Dynamically scale the minimum/target lightness cap
-        # Pitch black -> min lightness 0.05. Bright screen (>=0.30) -> min lightness 0.45.
-        min_l = max(0.05, 0.45 * min(1.0, screen_brightness / 0.30))
-        
-        if l < min_l:
-            l = min_l
+            # Filter to top scored pixels (vibrancy combined with spatial size)
+            top_vibrant = [(r, g, b) for score, r, g, b in scored_pixels if score > 0.005]
+            if not top_vibrant:
+                vibrant_color = closest_pixel if closest_pixel else (0, 0, 0)
+            else:
+                CLUSTER_BIN_SIZE = 32
+                quantized = [ (r//CLUSTER_BIN_SIZE*CLUSTER_BIN_SIZE, g//CLUSTER_BIN_SIZE*CLUSTER_BIN_SIZE, b//CLUSTER_BIN_SIZE*CLUSTER_BIN_SIZE) for r, g, b in top_vibrant[:100] ]
+                most_common = Counter(quantized).most_common(1)[0][0]
+                
+                bin_r, bin_g, bin_b = most_common
+                matching = [p for p in top_vibrant[:100] 
+                            if p[0]//CLUSTER_BIN_SIZE*CLUSTER_BIN_SIZE == bin_r and 
+                               p[1]//CLUSTER_BIN_SIZE*CLUSTER_BIN_SIZE == bin_g and 
+                               p[2]//CLUSTER_BIN_SIZE*CLUSTER_BIN_SIZE == bin_b]
+                
+                if matching:
+                    avg_v_r = sum(p[0] for p in matching) // len(matching)
+                    avg_v_g = sum(p[1] for p in matching) // len(matching)
+                    avg_v_b = sum(p[2] for p in matching) // len(matching)
+                    vibrant_color = (avg_v_r, avg_v_g, avg_v_b)
+                else:
+                    vibrant_color = top_vibrant[0]
+                    
+            # 6. Smooth Blend Guard between Weighted Average and Vibrant Color:
+            # Instead of a hard switch, we calculate a continuous blend factor based on the saturation (avg_s)
+            # of the average color and its proximity to the real pixels (min_dist).
+            avg_h, avg_l, avg_s = colorsys.rgb_to_hls(avg_r/255.0, avg_g/255.0, avg_b/255.0)
             
-        # Ensure minimum saturation of 0.25 (unless the image is highly black/white/grayscale)
-        if s < 0.25 and original_s > 0.05:
-            s = 0.25
+            # Proximity confidence factor (snaps to vibrant if average color does not exist in screen)
+            if min_dist > 35.0:
+                proximity_factor = max(0.0, 1.0 - (min_dist - 35.0) / 35.0)
+            else:
+                proximity_factor = 1.0
+                
+            # Overall confidence in using the average color
+            average_confidence = avg_s * proximity_factor
             
-        r_opt, g_opt, b_opt = colorsys.hls_to_rgb(h, l, s)
-        opt_color = (int(r_opt*255), int(g_opt*255), int(b_opt*255))
-        
-        update_smoothed_color(opt_color[0], opt_color[1], opt_color[2])
-        last_color_time = now
+            # Smoothly interpolate blend based on confidence
+            if average_confidence <= 0.05:
+                blend = 0.0
+            elif average_confidence >= 0.18:
+                blend = 1.0
+            else:
+                blend = (average_confidence - 0.05) / (0.18 - 0.05)
+                
+            final_color = (
+                int(vibrant_color[0] * (1.0 - blend) + avg_color[0] * blend),
+                int(vibrant_color[1] * (1.0 - blend) + avg_color[1] * blend),
+                int(vibrant_color[2] * (1.0 - blend) + avg_color[2] * blend)
+            )
             
-        buf.unmap(map_info)
+            # 7. Optimize color for keyboard backlight:
+            # Scale the overall target brightness (lightness) based on screen_brightness to prevent
+            # the keyboard from staying bright in dark scenes.
+            r_f, g_f, b_f = final_color[0]/255.0, final_color[1]/255.0, final_color[2]/255.0
+            h, l, s = colorsys.rgb_to_hls(r_f, g_f, b_f)
+            
+            original_s = s
+            
+            # Dynamically scale the minimum/target lightness cap
+            # Pitch black -> min lightness 0.05. Bright screen (>=0.30) -> min lightness 0.45.
+            min_l = max(0.05, 0.45 * min(1.0, screen_brightness / 0.30))
+            
+            if l < min_l:
+                l = min_l
+                
+            # Ensure minimum saturation of 0.25 (unless the image is highly black/white/grayscale)
+            if s < 0.25 and original_s > 0.05:
+                s = 0.25
+                
+            r_opt, g_opt, b_opt = colorsys.hls_to_rgb(h, l, s)
+            opt_color = (int(r_opt*255), int(g_opt*255), int(b_opt*255))
+            
+            update_smoothed_color(opt_color[0], opt_color[1], opt_color[2])
+            last_color_time = now
+        finally:
+            buf.unmap(map_info)
+            
+    # Explicitly clear variables to force immediate reference releases
+    del map_info
+    del buf
+    del sample
     return Gst.FlowReturn.OK
 
 def on_start_response(response, results):
