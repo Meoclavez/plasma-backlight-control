@@ -1,0 +1,13 @@
+[Unit]
+Description=Plasma Backlight Sync
+PartOf=plasma-workspace.target
+After=plasma-workspace.target
+
+[Service]
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/meoclavezz/.local/bin/plasma-backlight-sync.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=plasma-workspace.target
