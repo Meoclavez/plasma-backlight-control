@@ -38,13 +38,44 @@ pipeline = None
 
 last_color_time = 0
 
-# Color Smoothing Variables
 current_rgb = None
+_aura_props = None
 
 def set_keyboard_color(hex_color):
+    """Set the keyboard backlight color using D-Bus directly with asusctl fallback."""
+    global _aura_props
     try:
-        subprocess.run(["asusctl", "aura", "effect", "static", "--colour", hex_color], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except: pass
+        r = int(hex_color[0:2], 16)
+        g = int(hex_color[2:4], 16)
+        b = int(hex_color[4:6], 16)
+        
+        if _aura_props is None:
+            system_bus = dbus.SystemBus()
+            aura_obj = system_bus.get_object('xyz.ljones.Asusd', '/xyz/ljones/aura/tuf')
+            _aura_props = dbus.Interface(aura_obj, 'org.freedesktop.DBus.Properties')
+            
+        new_color1 = dbus.Struct((dbus.Byte(r), dbus.Byte(g), dbus.Byte(b)), signature='yyy')
+        new_color2 = dbus.Struct((dbus.Byte(0), dbus.Byte(0), dbus.Byte(0)), signature='yyy')
+        
+        new_data = dbus.Struct(
+            (
+                dbus.UInt32(0),   # Mode: Static
+                dbus.UInt32(0),   # Speed
+                new_color1,
+                new_color2,
+                dbus.String("Med"),
+                dbus.String("Right")
+            ),
+            signature='uu(yyy)(yyy)ss'
+        )
+        
+        _aura_props.Set('xyz.ljones.Aura', 'LedModeData', new_data)
+    except Exception as e:
+        # Fallback to subprocess if DBus fails
+        try:
+            subprocess.run(["asusctl", "aura", "effect", "static", "--colour", hex_color], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except:
+            pass
 
 def update_smoothed_color(target_r, target_g, target_b):
     global current_rgb
