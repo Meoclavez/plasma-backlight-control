@@ -136,7 +136,16 @@ def on_new_sample(appsink):
             avg_r, avg_g, avg_b = 0, 0, 0
         avg_color = (avg_r, avg_g, avg_b)
         
-        # 4. Generate the matching vibrant/dominant color from the bright parts of the screen
+        # 4. Check if the average color is in the bright screen area (min distance to actual pixels)
+        closest_pixel = None
+        min_dist = float('inf')
+        for p in bright_pixels:
+            d = rgb_dist(avg_color, p[0:3])
+            if d < min_dist:
+                min_dist = d
+                closest_pixel = p[0:3]
+                
+        # 5. Generate the matching vibrant/dominant color from the bright parts of the screen
         scored_pixels = []
         for r, g, b, h, l, s in bright_pixels:
             # Score highly for high saturation and moderate brightness
@@ -170,7 +179,7 @@ def on_new_sample(appsink):
             else:
                 vibrant_color = top_vibrant[0]
                 
-        # 5. Smooth Blend Guard between Weighted Average and Vibrant Color:
+        # 6. Smooth Blend Guard between Weighted Average and Vibrant Color:
         # Instead of a hard switch, we calculate a continuous blend factor based on the saturation (avg_s)
         # of the average color and its proximity to the real pixels (min_dist).
         avg_h, avg_l, avg_s = colorsys.rgb_to_hls(avg_r/255.0, avg_g/255.0, avg_b/255.0)
@@ -194,11 +203,11 @@ def on_new_sample(appsink):
             
         final_color = (
             int(vibrant_color[0] * (1.0 - blend) + avg_color[0] * blend),
-            int(vibrant_color[1] * (1.0 - blend) + avg_color[2] * blend),
+            int(vibrant_color[1] * (1.0 - blend) + avg_color[1] * blend),
             int(vibrant_color[2] * (1.0 - blend) + avg_color[2] * blend)
         )
         
-        # 5. Optimize color for keyboard backlight:
+        # 7. Optimize color for keyboard backlight:
         # Scale the overall target brightness (lightness) based on screen_brightness to prevent
         # the keyboard from staying bright in dark scenes.
         r_f, g_f, b_f = final_color[0]/255.0, final_color[1]/255.0, final_color[2]/255.0
