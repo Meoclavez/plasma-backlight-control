@@ -287,8 +287,21 @@ def on_new_sample(appsink):
     # Explicitly clear variables to force immediate reference releases
     del map_info
     del buf
-    del sample
     return Gst.FlowReturn.OK
+
+def on_session_closed(*args, **kwargs):
+    print("Portal session closed by compositor/user. Shutting down gracefully...")
+    cleanup_and_exit()
+    
+def on_gst_message(bus, message):
+    t = message.type
+    if t == Gst.MessageType.EOS:
+        print("GStreamer: End of Stream (EOS) received. Exiting gracefully...")
+        cleanup_and_exit()
+    elif t == Gst.MessageType.ERROR:
+        err, debug = message.parse_error()
+        print(f"GStreamer Error: {err} | Debug: {debug}. Exiting gracefully...")
+        cleanup_and_exit()
 
 def on_start_response(response, results):
     global node_id, pw_fd, pipeline
@@ -318,6 +331,11 @@ def on_start_response(response, results):
     appsink.set_property('emit-signals', True)
     appsink.connect('new-sample', on_new_sample)
     
+    # Attach message signal watch to pipeline bus
+    bus_gst = pipeline.get_bus()
+    bus_gst.add_signal_watch()
+    bus_gst.connect('message', on_gst_message)
+    
     pipeline.set_state(Gst.State.PLAYING)
 
 def on_select_response(response, results):
@@ -343,6 +361,9 @@ def on_create_response(response, results):
         
     session_path = results.get('session_handle')
     print("Session created. Awaiting monitor selection...")
+    
+    # Register portal session Closed signal receiver
+    bus.add_signal_receiver(on_session_closed, signal_name='Closed', dbus_interface='org.freedesktop.portal.Session', path=session_path)
     
     token_counter += 1
     handle_token = f"u{token_counter}"
