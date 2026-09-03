@@ -33,9 +33,20 @@ def resolve_plasma_wallpaper_path(path):
     return path if os.path.isfile(path) else None
 
 def get_current_wallpaper():
-    """Get the current wallpaper path. Try dbus first to support slideshows, fallback to config."""
+    """Get the current wallpaper path. Try native dbus first, then qdbus6, fallback to config."""
     try:
-        # Avoid python dbus properties deadlock by using a separate qdbus process
+        bus = dbus.SessionBus()
+        obj = bus.get_object('org.kde.plasmashell', '/PlasmaShell')
+        iface = dbus.Interface(obj, 'org.kde.PlasmaShell')
+        props = iface.wallpaper(dbus.UInt32(0))
+        if 'Image' in props:
+            path = resolve_plasma_wallpaper_path(str(props['Image']))
+            if path:
+                return path
+    except Exception:
+        pass
+
+    try:
         output = subprocess.check_output(['qdbus6', 'org.kde.plasmashell', '/PlasmaShell', 'org.kde.PlasmaShell.wallpaper', '0'], text=True)
         for line in output.split('\n'):
             if line.startswith('Image:'):
@@ -43,8 +54,8 @@ def get_current_wallpaper():
                 path = resolve_plasma_wallpaper_path(val)
                 if path:
                     return path
-    except Exception as e:
-        print(f"Error querying wallpaper dbus: {e}")
+    except Exception:
+        pass
 
     # Fallback to config file
     config_path = os.path.expanduser("~/.config/plasma-org.kde.plasma.desktop-appletsrc")
@@ -56,7 +67,7 @@ def get_current_wallpaper():
         config.read(config_path)
         
         for section in config.sections():
-            if "org.kde.image" in section and "Image" in config[section]:
+            if ("org.kde.image" in section or "org.kde.slideshow" in section) and "Image" in config[section]:
                 path = config[section]["Image"]
                 return resolve_plasma_wallpaper_path(path)
     except Exception as e:
@@ -238,9 +249,21 @@ def get_highlight_color(image_path):
 
 _aura_props = None
 
+def ensure_asusd_running():
+    """Ensure asusd service is active, starting it if necessary."""
+    try:
+        res = subprocess.run(["systemctl", "is-active", "--quiet", "asusd"])
+        if res.returncode != 0:
+            print("asusd is not running, starting it via systemctl...")
+            subprocess.run(["systemctl", "start", "asusd"], check=False)
+            time.sleep(0.5)
+    except Exception as e:
+        print(f"Failed to check/start asusd service: {e}")
+
 def set_keyboard_color(hex_color):
     """Set the keyboard backlight color using D-Bus directly with asusctl fallback."""
     global _aura_props
+    ensure_asusd_running()
     try:
         r = int(hex_color[0:2], 16)
         g = int(hex_color[2:4], 16)
@@ -268,6 +291,7 @@ def set_keyboard_color(hex_color):
         
         _aura_props.Set('xyz.ljones.Aura', 'LedModeData', new_data)
     except Exception as e:
+        _aura_props = None
         # Fallback to subprocess if DBus fails
         try:
             subprocess.run(["asusctl", "aura", "effect", "static", "--colour", hex_color], check=False)
@@ -276,17 +300,27 @@ def set_keyboard_color(hex_color):
 
 def main():
     print("Starting Plasma Backlight Sync Daemon...")
+    ensure_asusd_running()
     DBusGMainLoop(set_as_default=True)
     
     last_wallpaper = [None]
+    last_check_time = [0.0]
     
     def update_wallpaper(*args, **kwargs):
+        now = time.time()
+        if now - last_check_time[0] < 1.0:
+            return
+        last_check_time[0] = now
         current_wallpaper = get_current_wallpaper()
         if current_wallpaper and current_wallpaper != last_wallpaper[0]:
             print(f"Wallpaper changed: {current_wallpaper}")
             color = get_highlight_color(current_wallpaper)
             set_keyboard_color(color)
             last_wallpaper[0] = current_wallpaper
+
+    def poll_timer():
+        update_wallpaper()
+        return True
 
     try:
         bus = dbus.SessionBus()
@@ -301,14 +335,19 @@ def main():
             signal_name="wallpaperChanged"
         )
         
-        # Also listen to generic properties changed just in case wallpaper is treated as a property
+        # Also listen to PlasmaShell specific properties changed
         bus.add_signal_receiver(
             update_wallpaper,
             dbus_interface="org.freedesktop.DBus.Properties",
-            signal_name="PropertiesChanged"
+            signal_name="PropertiesChanged",
+            path="/PlasmaShell",
+            bus_name="org.kde.plasmashell"
         )
         
-        print("Listening for wallpaper changes via D-Bus...")
+        # Polling timer every 2 seconds for guaranteed slideshow detection
+        GLib.timeout_add_seconds(2, poll_timer)
+        
+        print("Listening for wallpaper changes via D-Bus & slideshow timer...")
         loop = GLib.MainLoop()
         loop.run()
     except Exception as e:
