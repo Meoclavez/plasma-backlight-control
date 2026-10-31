@@ -1,83 +1,81 @@
 # Plasma Keyboard Backlight Sync & Video Ambience
 
-A pair of high-performance, intelligent ambient lighting daemons for KDE Plasma on Linux (specifically optimized for ASUS TUF/ROG laptops using `asusctl` and `plasma-workspace`).
+A pair of lightweight ambient lighting daemons for KDE Plasma 6 on Linux (built for ASUS TUF/ROG laptops using `asusd`/`asusctl`).
 
-This project automatically syncs your keyboard backlight colors dynamically to match your current wallpaper or real-time screen content (Video Ambience) with advanced color analysis and smooth transitions.
+The keyboard backlight follows your wallpaper (including slideshows) or, on demand, the live screen content.
+
+Tested on: Plasma 6.8, asusctl 6.5, Python 3.14, Pillow 13, PyGObject 3.58, PipeWire 1.6.
 
 ---
 
 ## Features
 
-### 🌌 1. Static Wallpaper Sync (`plasma-backlight-sync.py`)
-- Background daemon that listens for active wallpaper changes via KDE D-Bus interface.
-- Automatically reads and resizes images to perform high-speed, noise-free color extraction.
-- Excludes dark shades and camera compression noise to ensure clean color tones.
-- Applies **Lightness-weighted and Saturation-squared** average calculation to highlight vibrant elements (like nebulas).
+### 🌌 Wallpaper Sync (`plasma-backlight-sync.py`)
+- Detects wallpaper changes via the `org.kde.PlasmaShell` D-Bus API (signal + 2 s poll, since Plasma 6 does not signal slideshow rotations).
+- Analyses only what is visible: honours Plasma's *Scaled and Cropped* fill mode and screen aspect ratio.
+- Wallpaper packages: picks the image matching your screen's aspect/resolution and the `images_dark` variant when the colour scheme is dark.
+- Smooth eased cross-fade between colours; bursts of changes (slideshow start-up) are coalesced.
+- Persistent colour cache (`~/.cache/plasma-backlight-sync/colors.json`) — repeat wallpapers cost ~0 ms.
+- Low footprint: ~20 MB resident, decoded image buffers are returned to the OS after each analysis.
+- `systemctl --user reload plasma-backlight-sync` re-reads the config and re-applies the current colour.
 
-### 🎬 2. Real-Time Video Ambience (`plasma-video-ambience.py`)
-- On-demand PipeWire-based screen capturing using GStreamer and XDG Desktop Portal.
-- **Adaptive Color Transition Engine:** Dynamically adjusts the transition speed (`alpha`) depending on the scale of color changes on screen:
-  - *Calm scenes* result in a slow, cinematic transition (`alpha = 0.08`) with zero LED flickering.
-  - *Radical changes* (flashes, explosions, scene cuts) scale up to near-instantaneous transitions (`alpha = 0.85`).
-- **Brightness-Aware Auto-Dimming:** Automatically scales the target backlight lightness based on overall screen luminance (caps at `0.05` for soft glow in pitch black scenes and standard `0.45` for bright scenes).
+### 🎬 Video Ambience (`plasma-video-ambience.py`)
+- PipeWire screen capture through the XDG ScreenCast portal (cursor hidden).
+- **Remembers the portal grant**: after the first run, it starts without the monitor-selection dialog.
+- Frame analysis runs in the GStreamer thread; a 30 Hz main-loop timer applies adaptive smoothing (slow blend for calm scenes, near-instant on cuts/flashes).
+- Writes to asusd only when the colour actually changes — asusd rewrites `/etc/asusd/aura_*.ron` on every update, so static scenes cause zero writes.
+- Pauses the wallpaper sync service while running and always restores it on exit (including a cancelled prompt), but only if it was running before.
 
-### 🛡️ 3. Premium Color Blending Guard (Desaturation Guard)
-- Bypasses neutral, cancelled-out average colors (e.g. orange and blue mixing to create muddy gray-pink).
-- Calculates a continuous **confidence factor** based on average saturation and scene proximity.
-- Dynamically blends the weighted average with the dominant vibrant color to prevent sudden color jumps, providing a butter-smooth morphing experience.
-
----
-
-## Installation & Setup
-
-### Requirements
-Ensure you have the required dependencies installed:
-```bash
-# Arch Linux
-sudo pacman -S python-gobject python-dbus gst-plugin-pipewire asusctl
-```
-
-### Installation
-1. Move the scripts to your local bin:
-   ```bash
-   cp plasma-backlight-sync.py plasma-video-ambience.py ~/.local/bin/
-   chmod +x ~/.local/bin/plasma-backlight-sync.py ~/.local/bin/plasma-video-ambience.py
-   ```
-2. Enable and start the wallpaper sync daemon systemd user service:
-   ```bash
-   mkdir -p ~/.config/systemd/user/
-   cp plasma-backlight-sync.service ~/.config/systemd/user/
-   systemctl --user daemon-reload
-   systemctl --user enable --now plasma-backlight-sync.service
-   ```
-
-### Running Video Ambience
-Simply run the script to stream your screen to the keyboard. It will automatically stop the wallpaper service to avoid conflicts and restart it when you exit:
-```bash
-~/.local/bin/plasma-video-ambience.py
-```
-
----
-
-## Color Analysis Engine
-
-Both services share a state-of-the-art color analysis pipeline:
-
+### 🎨 Colour Engine (`backlight_core.py`, shared)
 ```mermaid
 graph TD
-    A[Screen/Wallpaper Pixels] --> B[Convert to HSL]
-    B --> C[Filter out Dark Shades < 0.08]
-    C --> D[Weighted Average: l * s^2]
-    C --> E[Extract Dominant Vibrant Color]
-    D --> F[Calculate Confidence: Saturation * Proximity]
-    E --> G[Interpolate Smooth Blend]
-    F --> G
-    G --> H[HLS Keyboard Backlight Optimization]
-    H --> I[Apply Dynamic Backlight Intensity]
+    A[Wallpaper / frame] --> B[Visible-area crop + 96 px thumbnail]
+    B --> C[Median-cut palette, 20 clusters]
+    C --> D[OKLab score: chroma^1.5 x area^0.4 x usable lightness]
+    D --> E[Average the winning hue family]
+    E --> F[LED mapping: saturation boost, channel gamma, brightness]
+```
+- Perceptual OKLab space instead of HLS (HLS reports dark noise as fully saturated).
+- Saturated subjects beat large dull backgrounds; greyscale images give a neutral white.
+- **LED gamma correction**: RGB LEDs are linear, sRGB values are not — without correction oranges turn yellow and pastels turn white.
+- Brightness follows both the scene and the accent, so a bright subject on a black wallpaper still glows.
+
+---
+
+## Installation
+
+```bash
+# Arch Linux
+sudo pacman -S python-gobject python-dbus python-pillow gst-plugin-pipewire asusctl
+sudo systemctl enable --now asusd
+
+./install.sh   # copies to ~/.local/bin, installs + (re)starts the user service
+```
+
+### Video Ambience
+```bash
+~/.local/bin/plasma-video-ambience.py     # Ctrl+C to stop
+```
+To pick a different monitor, delete `~/.cache/plasma-backlight-sync/screencast-restore-token`.
+
+### Inspect colour choices
+```bash
+plasma-backlight-sync.py --analyze ~/Pictures/*.jpg
+# accent #9b6a55  led #fd7044  scene L 0.41  /home/.../a.jpg
 ```
 
 ---
 
-## Repository History
+## Configuration (optional)
 
-This repository tracks the full transition from the initial basic color extraction models to this optimized, adaptive ambient system.
+`~/.config/plasma-backlight-sync.conf` — every key is optional:
+
+```ini
+[backlight]
+gamma = 1.8            ; LED channel gamma (1.0 = raw sRGB). Raise if colours look washed out.
+saturation = 1.15      ; saturation multiplier before gamma
+min_brightness = 0.15  ; LED level for black wallpapers / dark scenes
+max_brightness = 1.0   ; LED level for bright wallpapers / scenes
+transition_ms = 800    ; wallpaper cross-fade (0 = instant)
+```
+Apply with `systemctl --user reload plasma-backlight-sync`.

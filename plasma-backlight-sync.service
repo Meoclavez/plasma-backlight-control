@@ -5,9 +5,11 @@ After=plasma-workspace.target
 
 [Service]
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/home/meoclavezz/.local/bin/plasma-backlight-sync.py
+ExecStart=%h/.local/bin/plasma-backlight-sync.py
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=3
+Nice=10
 
 [Install]
 WantedBy=plasma-workspace.target

@@ -1,358 +1,265 @@
 #!/usr/bin/env python3
-import sys
-import colorsys
-import subprocess
-import time
-import os
+"""Keep the ASUS keyboard backlight in sync with the KDE Plasma wallpaper.
+
+Usage:
+  plasma-backlight-sync.py                 run the daemon
+  plasma-backlight-sync.py --analyze IMG…  print the colours chosen for images
+"""
 import configparser
-from collections import Counter
-from PIL import Image
+import json
+import math
+import os
+import signal
+import sys
+from urllib.parse import unquote
 
 import dbus
 from dbus.mainloop.glib import DBusGMainLoop
 from gi.repository import GLib
 
-def resolve_plasma_wallpaper_path(path):
-    if not path:
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from backlight_core import (  # noqa: E402
+    AuraKeyboard, ColorCache, add_signal_handler, analyze_files, analyze_image, led_rgb, load_config,
+    load_thumbnail, log, oklab_to_rgb, release_memory, to_hex,
+)
+
+POLL_SECONDS = 2          # Plasma 6 does not signal slideshow rotations
+DEBOUNCE_MS = 300         # coalesce bursts of changes (e.g. slideshow start-up)
+FADE_STEP_MS = 33
+FILL_PRESERVE_ASPECT_CROP = 2
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".avif", ".bmp", ".tif", ".tiff", ".jxl", ".gif")
+APPLETSRC = os.path.expanduser("~/.config/plasma-org.kde.plasma.desktop-appletsrc")
+KDEGLOBALS = os.path.expanduser("~/.config/kdeglobals")
+
+
+def _is_image(name):
+    return name.lower().endswith(IMAGE_EXTS)
+
+
+def _color_scheme_is_dark():
+    parser = configparser.ConfigParser(strict=False, interpolation=None)
+    try:
+        parser.read(KDEGLOBALS)
+        r, g, b = (int(v) for v in parser["Colors:Window"]["BackgroundNormal"].split(",")[:3])
+    except (KeyError, ValueError, configparser.Error):
+        return False
+    return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255 < 0.5
+
+
+def _best_package_image(images_dir, screen):
+    """Pick the image whose WxH file name is closest to the screen resolution."""
+    try:
+        names = sorted(n for n in os.listdir(images_dir) if _is_image(n))
+    except OSError:
         return None
-    if path.startswith("file://"):
-        path = path[7:]
-    
+    if not names:
+        return None
+
+    def distance(name):
+        try:
+            w, h = (int(v) for v in os.path.splitext(name)[0].split("x"))
+            # aspect ratio first (portrait phone variants exist), then pixel count
+            return (round(abs(math.log((w / h) / (screen[0] / screen[1]))), 2),
+                    abs(math.log((w * h) / (screen[0] * screen[1]))))
+        except (ValueError, ZeroDivisionError):
+            return (float("inf"), 0.0)
+
+    return os.path.join(images_dir, min(names, key=distance))
+
+
+def resolve_wallpaper_path(url, screen):
+    if not url:
+        return None
+    path = url[7:] if url.startswith("file://") else url
+    if not os.path.exists(path):
+        path = unquote(path)
     if os.path.isdir(path):
-        # Plasma wallpaper themes usually have contents/images
-        images_dir = os.path.join(path, "contents", "images")
-        if os.path.isdir(images_dir):
-            images = [f for f in os.listdir(images_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-            if images:
-                return os.path.join(images_dir, images[0])
-        # Or maybe it's just a folder of images for slideshow
-        images = [f for f in os.listdir(path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-        if images:
-            return os.path.join(path, images[0])
-    
+        # Plasma wallpaper package: contents/images[_dark]/<W>x<H>.<ext>
+        variants = ["images_dark", "images"] if _color_scheme_is_dark() else ["images"]
+        for variant in variants:
+            found = _best_package_image(os.path.join(path, "contents", variant), screen)
+            if found:
+                return found
+        try:
+            images = sorted(n for n in os.listdir(path) if _is_image(n))
+        except OSError:
+            images = []
+        return os.path.join(path, images[0]) if images else None
     return path if os.path.isfile(path) else None
 
-def get_current_wallpaper():
-    """Get the current wallpaper path. Try native dbus first, then qdbus6, fallback to config."""
-    try:
-        bus = dbus.SessionBus()
-        obj = bus.get_object('org.kde.plasmashell', '/PlasmaShell')
-        iface = dbus.Interface(obj, 'org.kde.PlasmaShell')
-        props = iface.wallpaper(dbus.UInt32(0))
-        if 'Image' in props:
-            path = resolve_plasma_wallpaper_path(str(props['Image']))
-            if path:
-                return path
-    except Exception:
-        pass
 
+def _wallpaper_from_config():
+    parser = configparser.ConfigParser(strict=False, interpolation=None)
     try:
-        output = subprocess.check_output(['qdbus6', 'org.kde.plasmashell', '/PlasmaShell', 'org.kde.PlasmaShell.wallpaper', '0'], text=True)
-        for line in output.split('\n'):
-            if line.startswith('Image:'):
-                val = line.split(':', 1)[1].strip()
-                path = resolve_plasma_wallpaper_path(val)
-                if path:
-                    return path
-    except Exception:
-        pass
-
-    # Fallback to config file
-    config_path = os.path.expanduser("~/.config/plasma-org.kde.plasma.desktop-appletsrc")
-    if not os.path.exists(config_path):
+        parser.read(APPLETSRC)
+    except configparser.Error as e:
+        log(f"Error reading {APPLETSRC}: {e}")
         return None
-        
-    try:
-        config = configparser.ConfigParser(strict=False)
-        config.read(config_path)
-        
-        for section in config.sections():
-            if ("org.kde.image" in section or "org.kde.slideshow" in section) and "Image" in config[section]:
-                path = config[section]["Image"]
-                return resolve_plasma_wallpaper_path(path)
-    except Exception as e:
-        print(f"Error querying wallpaper config: {e}")
-        
+    for section in parser.sections():
+        if ("org.kde.image" in section or "org.kde.slideshow" in section) and "Image" in parser[section]:
+            return parser[section]["Image"]
     return None
 
-def get_highlight_color(image_path):
-    """Analyze the image: get average color, ensure it exists in the wallpaper, or generate a matching color."""
-    try:
-        img = Image.open(image_path).convert('RGB')
-        # Resize to 64x64 for speed and noise reduction
-        img = img.resize((64, 64))
-        
+
+class WallpaperSync:
+    def __init__(self):
+        self.cfg = load_config()
+        self.kbd = AuraKeyboard()
+        self.cache = ColorCache()
+        self.session = dbus.SessionBus()
+        self._shell = None
+        self._screen = None
+        self.current = None       # (path, crop_aspect) last applied
+        self.analysis = None      # (lab, scene_l) of the current wallpaper
+        self._pending = None      # GLib source id of the debounced apply
+        self._fade = None         # GLib source id of the running fade
+
+    # ---------------------------------------------------------------- plasma queries
+
+    def _plasmashell(self):
+        if self._shell is None:
+            obj = self.session.get_object("org.kde.plasmashell", "/PlasmaShell")
+            self._shell = dbus.Interface(obj, "org.kde.PlasmaShell")
+        return self._shell
+
+    def _screen_size(self):
+        if self._screen is None:
+            try:
+                geo = json.loads(self._plasmashell().evaluateScript(
+                    "print(JSON.stringify(screenGeometry(0)))"))
+                self._screen = (int(geo["width"]), int(geo["height"]))
+            except (dbus.DBusException, ValueError, KeyError, TypeError):
+                return (1920, 1080)  # retried on the next query
+        return self._screen
+
+    def query_wallpaper(self):
+        """Return (image path, crop aspect or None) for screen 0."""
+        url, fill_mode = None, FILL_PRESERVE_ASPECT_CROP
         try:
-            pixels = list(img.get_flattened_data())
-        except AttributeError:
-            pixels = list(img.getdata())
-            
-        def rgb_dist(p1, p2):
-            return ((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2 + (p1[2] - p2[2])**2)**0.5
+            props = self._plasmashell().wallpaper(dbus.UInt32(0))
+            url = str(props.get("Image", "")) or None
+            fill_mode = int(props.get("FillMode", fill_mode))
+        except dbus.DBusException:
+            self._shell = None  # plasmashell restarted or not up yet
+            self._screen = None
+            url = _wallpaper_from_config()
+        screen = self._screen_size()
+        path = resolve_wallpaper_path(url, screen)
+        if not path:
+            return None
+        aspect = screen[0] / screen[1] if fill_mode == FILL_PRESERVE_ASPECT_CROP else None
+        return path, aspect
 
-        # 1. Convert all pixels to HSL to perform brightness-aware analysis
-        pixels_hls = []
-        for r, g, b in pixels:
-            h, l, s = colorsys.rgb_to_hls(r/255.0, g/255.0, b/255.0)
-            pixels_hls.append((r, g, b, h, l, s))
+    # ---------------------------------------------------------------- update flow
 
-        # Calculate overall screen brightness (average lightness of all pixels)
-        screen_brightness = sum(p[4] for p in pixels_hls) / len(pixels_hls)
-
-        # 2. Filter out extremely dark/black pixels to avoid camera noise & compression artifacts
-        # dominating the average (e.g. preventing subtle dark red/blue tones from taking over)
-        bright_pixels = [p for p in pixels_hls if p[4] >= 0.08]
-        if not bright_pixels:
-            bright_pixels = pixels_hls  # Fallback if the whole screen is pitch black
-
-        # 3. Calculate a weighted average of the bright parts of the screen
-        # We weight each pixel by its lightness and square of saturation to emphasize highly vibrant elements
-        has_saturation = any(p[5] >= 0.15 for p in bright_pixels)
-        
-        total_weight = 0
-        weighted_r = 0.0
-        weighted_g = 0.0
-        weighted_b = 0.0
-        
-        for r, g, b, h, l, s in bright_pixels:
-            if has_saturation:
-                weight = l * (s ** 2.0)  # Emphasize highly saturated colors (e.g. pink nebulas)
-            else:
-                weight = l
-            weighted_r += r * weight
-            weighted_g += g * weight
-            weighted_b += b * weight
-            total_weight += weight
-            
-        if total_weight > 0:
-            avg_r = int(weighted_r / total_weight)
-            avg_g = int(weighted_g / total_weight)
-            avg_b = int(weighted_b / total_weight)
-        else:
-            avg_r, avg_g, avg_b = 0, 0, 0
-        avg_color = (avg_r, avg_g, avg_b)
-        
-        # 4. Check if the average color is in the bright screen area (min distance to actual pixels)
-        closest_pixel = None
-        min_dist = float('inf')
-        for p in bright_pixels:
-            d = rgb_dist(avg_color, p[0:3])
-            if d < min_dist:
-                min_dist = d
-                closest_pixel = p[0:3]
-                
-        # 5. Generate the matching vibrant/dominant color from the bright parts of the screen
-        # We quantize all bright pixels to calculate the area (size) of each color
-        AREA_BIN_SIZE = 24
-        bin_counts = Counter()
-        for r, g, b, h, l, s in bright_pixels:
-            qr = (r // AREA_BIN_SIZE) * AREA_BIN_SIZE
-            qg = (g // AREA_BIN_SIZE) * AREA_BIN_SIZE
-            qb = (b // AREA_BIN_SIZE) * AREA_BIN_SIZE
-            bin_counts[(qr, qg, qb)] += 1
-            
-        # Score each pixel by combining its saturation, brightness, and its color area count
-        scored_pixels = []
-        for r, g, b, h, l, s in bright_pixels:
-            brightness_factor = 1.0 - abs(l - 0.5) * 2.0
-            brightness_factor = max(0.0, brightness_factor)
-            
-            qr = (r // AREA_BIN_SIZE) * AREA_BIN_SIZE
-            qg = (g // AREA_BIN_SIZE) * AREA_BIN_SIZE
-            qb = (b // AREA_BIN_SIZE) * AREA_BIN_SIZE
-            area_factor = (bin_counts[(qr, qg, qb)] / len(bright_pixels)) ** 0.5
-            
-            score = (s ** 1.5) * brightness_factor * (area_factor ** 0.5)
-            scored_pixels.append((score, r, g, b))
-            
-        scored_pixels.sort(key=lambda x: x[0], reverse=True)
-        
-        # Filter to top scored pixels (vibrancy combined with spatial size)
-        top_vibrant = [(r, g, b) for score, r, g, b in scored_pixels if score > 0.005]
-        if not top_vibrant:
-            vibrant_color = closest_pixel if closest_pixel else (0, 0, 0)
-        else:
-            CLUSTER_BIN_SIZE = 32
-            quantized = [ (r//CLUSTER_BIN_SIZE*CLUSTER_BIN_SIZE, g//CLUSTER_BIN_SIZE*CLUSTER_BIN_SIZE, b//CLUSTER_BIN_SIZE*CLUSTER_BIN_SIZE) for r, g, b in top_vibrant[:100] ]
-            most_common = Counter(quantized).most_common(1)[0][0]
-            
-            bin_r, bin_g, bin_b = most_common
-            matching = [p for p in top_vibrant[:100] 
-                        if p[0]//CLUSTER_BIN_SIZE*CLUSTER_BIN_SIZE == bin_r and 
-                           p[1]//CLUSTER_BIN_SIZE*CLUSTER_BIN_SIZE == bin_g and 
-                           p[2]//CLUSTER_BIN_SIZE*CLUSTER_BIN_SIZE == bin_b]
-            
-            if matching:
-                avg_v_r = sum(p[0] for p in matching) // len(matching)
-                avg_v_g = sum(p[1] for p in matching) // len(matching)
-                avg_v_b = sum(p[2] for p in matching) // len(matching)
-                vibrant_color = (avg_v_r, avg_v_g, avg_v_b)
-            else:
-                vibrant_color = top_vibrant[0]
-                
-        # 6. Smooth Blend Guard between Weighted Average and Vibrant Color:
-        # Instead of a hard switch, we calculate a continuous blend factor based on the saturation (avg_s)
-        # of the average color and its proximity to the real pixels (min_dist).
-        avg_h, avg_l, avg_s = colorsys.rgb_to_hls(avg_r/255.0, avg_g/255.0, avg_b/255.0)
-        
-        # Proximity confidence factor (snaps to vibrant if average color does not exist in screen)
-        if min_dist > 35.0:
-            proximity_factor = max(0.0, 1.0 - (min_dist - 35.0) / 35.0)
-        else:
-            proximity_factor = 1.0
-            
-        # Overall confidence in using the average color
-        average_confidence = avg_s * proximity_factor
-        
-        # Smoothly interpolate blend based on confidence
-        if average_confidence <= 0.05:
-            blend = 0.0
-        elif average_confidence >= 0.18:
-            blend = 1.0
-        else:
-            blend = (average_confidence - 0.05) / (0.18 - 0.05)
-            
-        final_color = (
-            int(vibrant_color[0] * (1.0 - blend) + avg_color[0] * blend),
-            int(vibrant_color[1] * (1.0 - blend) + avg_color[1] * blend),
-            int(vibrant_color[2] * (1.0 - blend) + avg_color[2] * blend)
-        )
-        
-        # 7. Optimize color for keyboard backlight:
-        # Scale the overall target brightness (lightness) based on screen_brightness to prevent
-        # the keyboard from staying bright in dark scenes.
-        r_f, g_f, b_f = final_color[0]/255.0, final_color[1]/255.0, final_color[2]/255.0
-        h, l, s = colorsys.rgb_to_hls(r_f, g_f, b_f)
-        
-        original_s = s
-        
-        # Dynamically scale the minimum/target lightness cap
-        # Pitch black -> min lightness 0.05. Bright screen (>=0.30) -> min lightness 0.45.
-        min_l = max(0.05, 0.45 * min(1.0, screen_brightness / 0.30))
-        
-        if l < min_l:
-            l = min_l
-            
-        # Ensure minimum saturation of 0.25 (unless the image is highly black/white/grayscale)
-        if s < 0.25 and original_s > 0.05:
-            s = 0.25
-            
-        r_opt, g_opt, b_opt = colorsys.hls_to_rgb(h, l, s)
-        opt_color = (int(r_opt*255), int(g_opt*255), int(b_opt*255))
-        
-        return f"{opt_color[0]:02x}{opt_color[1]:02x}{opt_color[2]:02x}"
-            
-    except Exception as e:
-        print(f"Error processing image {image_path}: {e}")
-        
-    return "ffffff" # Default to white on error
-
-_aura_props = None
-
-def ensure_asusd_running():
-    """Ensure asusd service is active, starting it if necessary."""
-    try:
-        res = subprocess.run(["systemctl", "is-active", "--quiet", "asusd"])
-        if res.returncode != 0:
-            print("asusd is not running, starting it via systemctl...")
-            subprocess.run(["systemctl", "start", "asusd"], check=False)
-            time.sleep(0.5)
-    except Exception as e:
-        print(f"Failed to check/start asusd service: {e}")
-
-def set_keyboard_color(hex_color):
-    """Set the keyboard backlight color using D-Bus directly with asusctl fallback."""
-    global _aura_props
-    ensure_asusd_running()
-    try:
-        r = int(hex_color[0:2], 16)
-        g = int(hex_color[2:4], 16)
-        b = int(hex_color[4:6], 16)
-        
-        if _aura_props is None:
-            system_bus = dbus.SystemBus()
-            aura_obj = system_bus.get_object('xyz.ljones.Asusd', '/xyz/ljones/aura/tuf')
-            _aura_props = dbus.Interface(aura_obj, 'org.freedesktop.DBus.Properties')
-            
-        new_color1 = dbus.Struct((dbus.Byte(r), dbus.Byte(g), dbus.Byte(b)), signature='yyy')
-        new_color2 = dbus.Struct((dbus.Byte(0), dbus.Byte(0), dbus.Byte(0)), signature='yyy')
-        
-        new_data = dbus.Struct(
-            (
-                dbus.UInt32(0),   # Mode: Static
-                dbus.UInt32(0),   # Speed
-                new_color1,
-                new_color2,
-                dbus.String("Med"),
-                dbus.String("Right")
-            ),
-            signature='uu(yyy)(yyy)ss'
-        )
-        
-        _aura_props.Set('xyz.ljones.Aura', 'LedModeData', new_data)
-    except Exception as e:
-        _aura_props = None
-        # Fallback to subprocess if DBus fails
-        try:
-            subprocess.run(["asusctl", "aura", "effect", "static", "--colour", hex_color], check=False)
-        except:
-            pass
-
-def main():
-    print("Starting Plasma Backlight Sync Daemon...")
-    ensure_asusd_running()
-    DBusGMainLoop(set_as_default=True)
-    
-    last_wallpaper = [None]
-    last_check_time = [0.0]
-    
-    def update_wallpaper(*args, **kwargs):
-        now = time.time()
-        if now - last_check_time[0] < 1.0:
-            return
-        last_check_time[0] = now
-        current_wallpaper = get_current_wallpaper()
-        if current_wallpaper and current_wallpaper != last_wallpaper[0]:
-            print(f"Wallpaper changed: {current_wallpaper}")
-            color = get_highlight_color(current_wallpaper)
-            set_keyboard_color(color)
-            last_wallpaper[0] = current_wallpaper
-
-    def poll_timer():
-        update_wallpaper()
+    def check(self, *_args):
+        wallpaper = self.query_wallpaper()
+        if wallpaper and wallpaper != self.current:
+            if self._pending:
+                GLib.source_remove(self._pending)
+            self._pending = GLib.timeout_add(DEBOUNCE_MS, self._apply_pending, wallpaper)
         return True
 
-    try:
-        bus = dbus.SessionBus()
-        
-        # Initial check
-        update_wallpaper()
-        
-        # Listen for the wallpaperChanged signal on PlasmaShell
-        bus.add_signal_receiver(
-            update_wallpaper,
-            dbus_interface="org.kde.PlasmaShell",
-            signal_name="wallpaperChanged"
-        )
-        
-        # Also listen to PlasmaShell specific properties changed
-        bus.add_signal_receiver(
-            update_wallpaper,
-            dbus_interface="org.freedesktop.DBus.Properties",
-            signal_name="PropertiesChanged",
-            path="/PlasmaShell",
-            bus_name="org.kde.plasmashell"
-        )
-        
-        # Polling timer every 2 seconds for guaranteed slideshow detection
-        GLib.timeout_add_seconds(2, poll_timer)
-        
-        print("Listening for wallpaper changes via D-Bus & slideshow timer...")
+    def _apply_pending(self, wallpaper):
+        self._pending = None
+        self.apply(wallpaper)
+        return False
+
+    def analyze(self, path, aspect):
+        try:
+            key = ColorCache.key(path, aspect)
+        except OSError as e:
+            log(f"Cannot read {path}: {e}")
+            return None
+        cached = self.cache.get(key)
+        if cached:
+            return cached
+        try:
+            lab, scene_l = analyze_image(load_thumbnail(path, aspect))
+        except Exception as e:  # any decoder error must not kill the daemon
+            log(f"Error processing image {path}: {e}")
+            return None
+        finally:
+            release_memory()
+        self.cache.put(key, lab, scene_l)
+        return lab, scene_l
+
+    def apply(self, wallpaper):
+        path, aspect = wallpaper
+        analysis = self.analyze(path, aspect)
+        self.current = wallpaper
+        if analysis is None:
+            return
+        self.analysis = analysis
+        lab, scene_l = analysis
+        rgb = led_rgb(lab, scene_l, self.cfg)
+        log(f"Wallpaper changed: {path} -> accent #{to_hex(oklab_to_rgb(lab))}, led #{to_hex(rgb)}")
+        self.fade_to(rgb)
+
+    def fade_to(self, target):
+        if self._fade:
+            GLib.source_remove(self._fade)
+            self._fade = None
+        start = self.kbd.last_rgb or self.kbd.read_rgb()
+        steps = self.cfg.transition_ms // FADE_STEP_MS
+        if start is None or steps <= 1:
+            self.kbd.set_rgb(target)
+            return
+        state = {"i": 0}
+
+        def step():
+            state["i"] += 1
+            t = state["i"] / steps
+            t = t * t * (3 - 2 * t)  # ease in-out
+            self.kbd.set_rgb(tuple(round(s + (e - s) * t) for s, e in zip(start, target)))
+            if state["i"] >= steps:
+                self._fade = None
+                return False
+            return True
+
+        self._fade = GLib.timeout_add(FADE_STEP_MS, step)
+
+    def reload(self):
+        self.cfg = load_config()
+        log(f"Config reloaded: {self.cfg}")
+        if self.analysis:
+            self.fade_to(led_rgb(*self.analysis, self.cfg))
+        return True
+
+    # ---------------------------------------------------------------- main loop
+
+    def run(self):
+        self.session.add_signal_receiver(
+            self.check, dbus_interface="org.kde.PlasmaShell", signal_name="wallpaperChanged")
+        GLib.timeout_add_seconds(POLL_SECONDS, self.check)
+        add_signal_handler(signal.SIGHUP, self.reload)
         loop = GLib.MainLoop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            add_signal_handler(sig, loop.quit)
+
+        wallpaper = self.query_wallpaper()
+        if wallpaper:
+            self.apply(wallpaper)
+        log("Listening for wallpaper changes via D-Bus & slideshow timer...")
         loop.run()
-    except Exception as e:
-        print(f"Failed to setup DBus listener: {e}")
+
+
+def main():
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "--analyze" and len(sys.argv) > 2:
+            analyze_files(sys.argv[2:])
+            return
+        print(__doc__.strip(), file=sys.stderr)
+        sys.exit(2)
+
+    log("Starting Plasma Backlight Sync Daemon...")
+    DBusGMainLoop(set_as_default=True)
+    try:
+        WallpaperSync().run()
+    except dbus.DBusException as e:
+        log(f"Failed to set up D-Bus: {e}")
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
