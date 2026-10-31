@@ -23,7 +23,7 @@ Tested on: Plasma 6.8, asusctl 6.5, Python 3.14, Pillow 13, PyGObject 3.58, Pipe
 - PipeWire screen capture through the XDG ScreenCast portal (cursor hidden).
 - **Remembers the portal grant**: after the first run, it starts without the monitor-selection dialog.
 - Frame analysis runs in the GStreamer thread; a 30 Hz main-loop timer applies adaptive smoothing (slow blend for calm scenes, near-instant on cuts/flashes).
-- Writes to asusd only when the colour actually changes — asusd rewrites `/etc/asusd/aura_*.ron` on every update, so static scenes cause zero writes.
+- Writes only when the colour actually changes (static scenes cause zero writes); frames go straight to `kbd_rgb_mode` when the udev rule is installed.
 - Pauses the wallpaper sync service while running and always restores it on exit (including a cancelled prompt), but only if it was running before.
 
 ### 🎨 Colour Engine (`backlight_core.py`, shared)
@@ -50,6 +50,17 @@ sudo pacman -S python-gobject python-dbus python-pillow gst-plugin-pipewire asus
 sudo systemctl enable --now asusd
 
 ./install.sh   # copies to ~/.local/bin, installs + (re)starts the user service
+```
+
+### Direct keyboard writes (recommended)
+asusd rewrites `/etc/asusd/aura_*.ron` on every colour change. This rule lets `wheel` members write the kernel's
+`kbd_rgb_mode` attribute directly, so fade steps and video frames skip asusd; only each wallpaper's final colour is
+stored in asusd (it survives suspend/reboot). Without it everything still works through asusd.
+```bash
+sudo install -m 644 udev/90-asus-kbd-rgb.rules /etc/udev/rules.d/
+sudo udevadm control --reload
+sudo udevadm trigger --action=change --subsystem-match=leds --sysname-match='asus::kbd_backlight'
+systemctl --user restart plasma-backlight-sync
 ```
 
 ### Video Ambience

@@ -217,7 +217,7 @@ class Ambience:
             diff = sum((c - t) ** 2 for c, t in zip(self._current, target)) ** 0.5
             alpha = _smoothing_alpha(diff, dt)
             self._current = [c + (t - c) * alpha for c, t in zip(self._current, target)]
-        self.kbd.set_rgb(tuple(round(c) for c in self._current))
+        self.kbd.set_rgb(tuple(round(c) for c in self._current), persist=False)
         return True
 
     def _on_gst_message(self, _bus, message):
@@ -274,6 +274,8 @@ def main():
         if sync_was_active:
             log("Restarting background wallpaper sync...")
             _systemctl_user("start", SYNC_SERVICE)
+        elif ambience and ambience.kbd.last_rgb:
+            ambience.kbd.set_rgb(ambience.kbd.last_rgb)  # keep the last colour across suspend
 
 
 if __name__ == "__main__":

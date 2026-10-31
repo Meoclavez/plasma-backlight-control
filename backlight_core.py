@@ -34,6 +34,7 @@ CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/
 ASUSD_BUS = "xyz.ljones.Asusd"
 AURA_ROOT = "/xyz/ljones/aura"
 AURA_IFACE = "xyz.ljones.Aura"
+SYSFS_RGB_MODE = "/sys/class/leds/asus::kbd_backlight/kbd_rgb_mode"
 
 
 def log(msg):
@@ -326,8 +327,10 @@ def _mode_data(rgb):
 class AuraKeyboard:
     """Static-colour writer for the asusd Aura D-Bus interface with an asusctl fallback.
 
-    Identical consecutive colours are skipped: asusd rewrites
-    /etc/asusd/aura_<device>.ron on every LedModeData change.
+    asusd rewrites /etc/asusd/aura_<device>.ron on every LedModeData change, so
+    transient colours (fade steps, video frames) go straight to the kernel's
+    kbd_rgb_mode attribute when it is writable (see udev/90-asus-kbd-rgb.rules)
+    and only colours that should survive suspend/reboot go through asusd.
     """
 
     RETRY_SECONDS = 2.0
@@ -335,7 +338,20 @@ class AuraKeyboard:
     def __init__(self):
         self._props = None
         self._retry_at = 0.0
-        self.last_rgb = None
+        self.last_rgb = None    # colour currently on the keyboard
+        self._saved_rgb = None  # colour last stored in asusd
+        self.sysfs_rgb = SYSFS_RGB_MODE if os.access(SYSFS_RGB_MODE, os.W_OK) else None
+
+    def _write_sysfs(self, rgb):
+        try:
+            with open(self.sysfs_rgb, "w") as f:
+                # cmd 0 = apply without saving to firmware, mode 0 = static, speed 0
+                f.write("0 0 {} {} {} 0".format(*rgb))
+            return True
+        except OSError as e:
+            log(f"Direct kbd_rgb_mode write failed ({e}); using asusd only")
+            self.sysfs_rgb = None
+            return False
 
     def _connect(self):
         bus = dbus.SystemBus()
@@ -361,10 +377,23 @@ class AuraKeyboard:
             self._props = None
             return None
 
-    def set_rgb(self, rgb, force=False):
+    def set_rgb(self, rgb, force=False, persist=True):
+        """Show rgb on the keyboard; persist=False skips asusd when sysfs is usable."""
         rgb = tuple(min(max(int(v), 0), 255) for v in rgb)
-        if rgb == self.last_rgb and not force:
+        if not persist and self.sysfs_rgb:
+            if rgb == self.last_rgb and not force:
+                return True
+            if self._write_sysfs(rgb):
+                self.last_rgb = rgb
+                return True
+        if rgb == self.last_rgb == self._saved_rgb and not force:
             return True
+        if self.sysfs_rgb and rgb != self.last_rgb:
+            # asusd may ignore a Set equal to what it already stores, while the
+            # keyboard still shows a transient colour: apply directly first.
+            if self._write_sysfs(rgb) and rgb == self._saved_rgb and not force:
+                self.last_rgb = rgb
+                return True
         try:
             if self._props is None:
                 self._connect()
@@ -373,7 +402,7 @@ class AuraKeyboard:
             self._props = None
             if not self._fallback(rgb, e):
                 return False
-        self.last_rgb = rgb
+        self.last_rgb = self._saved_rgb = rgb
         return True
 
     def _fallback(self, rgb, err):

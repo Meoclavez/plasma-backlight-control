@@ -29,6 +29,7 @@ graph TD
 | `plasma-video-ambience.py` | Real-time screen ambience | `Ambience._request()` (portal helper), `_on_new_sample()` (GStreamer thread), `_tick()` (30 Hz main loop) |
 | `plasma-backlight-sync.service` | systemd user unit (`ExecReload` = SIGHUP) | `%h/.local/bin/plasma-backlight-sync.py` |
 | `install.sh` | Copies scripts + core to `~/.local/bin`, installs unit, restarts | — |
+| `udev/90-asus-kbd-rgb.rules` | Installed at `/etc/udev/rules.d/` (2026-10-31): chgrp wheel + g+w on `kbd_rgb_mode` | `AuraKeyboard._write_sysfs()` |
 
 ---
 
@@ -51,7 +52,7 @@ graph TD
 ---
 
 ## 5. Conventions & Gotchas
-- **asusd rewrites `/etc/asusd/aura_tuf.ron` on every `LedModeData` Set** → always go through `AuraKeyboard.set_rgb` (dedupes identical colours). Never write per-frame unconditionally.
+- **asusd rewrites `/etc/asusd/aura_tuf.ron` on every `LedModeData` Set** → always go through `AuraKeyboard.set_rgb` (dedupes identical colours). Transient colours use `persist=False` (fade steps, ambience frames) → written as `0 0 r g b 0` to `/sys/class/leds/asus::kbd_backlight/kbd_rgb_mode` (kernel: cmd 0 = apply/0xB3, 1 = save to BIOS/0xB4); `persist=True` (final fade colour) also goes to asusd. Measured: one wallpaper fade = 24 direct writes + 1 asusd rewrite. Falls back to asusd-only if the attribute is not writable.
 - asusd persists the last colour itself, so suspend/resume and asusd restarts restore it without help.
 - Aura object path is discovered by introspecting `/xyz/ljones/aura` (fallback `/tuf`).
 - `pipewiresrc path=` is deprecated but still correct: the portal returns a node id, `target-object` wants a name/serial.
@@ -61,4 +62,3 @@ graph TD
 
 ## 6. Pending
 - LED gamma default (1.8) was chosen without on-keyboard calibration; tune via config after eyeballing.
-- Optional: write `/sys/class/leds/asus::kbd_backlight/kbd_rgb_mode` directly (needs a udev rule in /etc) to bypass asusd's per-write config file rewrite in ambience mode.

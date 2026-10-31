@@ -1,0 +1,6 @@
+# Let members of "wheel" set the ASUS keyboard RGB colour without root, so
+# plasma-backlight-sync can apply fade steps and video frames directly instead
+# of making asusd rewrite /etc/asusd/aura_*.ron on every change.
+# Kernel attribute format: "cmd mode r g b speed" (cmd 0 = apply, not saved to firmware).
+ACTION=="add|change", SUBSYSTEM=="leds", KERNEL=="asus::kbd_backlight", \
+  RUN+="/usr/bin/chgrp wheel /sys%p/kbd_rgb_mode", RUN+="/usr/bin/chmod g+w /sys%p/kbd_rgb_mode"

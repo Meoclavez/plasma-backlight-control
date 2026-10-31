@@ -211,8 +211,10 @@ class WallpaperSync:
             state["i"] += 1
             t = state["i"] / steps
             t = t * t * (3 - 2 * t)  # ease in-out
-            self.kbd.set_rgb(tuple(round(s + (e - s) * t) for s, e in zip(start, target)))
-            if state["i"] >= steps:
+            done = state["i"] >= steps
+            # only the final colour is stored in asusd (it rewrites its config per change)
+            self.kbd.set_rgb(tuple(round(s + (e - s) * t) for s, e in zip(start, target)), persist=done)
+            if done:
                 self._fade = None
                 return False
             return True
