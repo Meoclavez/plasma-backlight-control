@@ -22,7 +22,8 @@ Tested on: Plasma 6.8, asusctl 6.5, Python 3.14, Pillow 13, PyGObject 3.58, Pipe
 ### 🎬 Video Ambience (`plasma-video-ambience.py`)
 - PipeWire screen capture through the XDG ScreenCast portal (cursor hidden).
 - **Remembers the portal grant**: after the first run, it starts without the monitor-selection dialog.
-- Frame analysis runs in the GStreamer thread; a 30 Hz main-loop timer applies adaptive smoothing (slow blend for calm scenes, near-instant on cuts/flashes).
+- Frame analysis runs in the GStreamer thread; a 30 Hz main-loop timer applies smoothing whose speed follows how much of the screen changed: slow blends for small changes, near-instant on scene cuts.
+- **Flicker-free with moving popups**: the current colour gets a hysteresis bonus, and a new colour must win 5 consecutive frames before it replaces it (scene cuts bypass this). Small windows or popups moving across the screen no longer make the keyboard flash between two colours.
 - Writes only when the colour actually changes (static scenes cause zero writes); frames go straight to `kbd_rgb_mode` when the udev rule is installed.
 - Pauses the wallpaper sync service while running and always restores it on exit (including a cancelled prompt), but only if it was running before.
 

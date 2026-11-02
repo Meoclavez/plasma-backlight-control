@@ -18,14 +18,15 @@ try:
     from gi.repository import GLib, Gst
     import dbus
     from dbus.mainloop.glib import DBusGMainLoop
-    from PIL import Image
+    from PIL import Image, ImageChops, ImageStat
 except ImportError:
     print("Dependencies missing! Ensure python-gobject, python-dbus, python-pillow and gst-plugin-pipewire are installed.")
     sys.exit(1)
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from backlight_core import (  # noqa: E402
-    CACHE_DIR, AuraKeyboard, add_signal_handler, analyze_image, led_rgb, load_config, log,
+    CACHE_DIR, AuraKeyboard, accent_hue, add_signal_handler, analyze_image, led_rgb, load_config, log,
+    same_hue,
 )
 
 SYNC_SERVICE = "plasma-backlight-sync"
@@ -33,6 +34,14 @@ FRAME_W, FRAME_H = 64, 36   # analysis frame (16:9)
 ANALYSIS_FPS = 30
 OUTPUT_HZ = 30
 TOKEN_PATH = os.path.join(CACHE_DIR, "screencast-restore-token")
+
+# Flicker control. A small window or popup moving over the screen changes
+# well under 1% of the pixels (motion < 0.01) while a scene cut changes ~25%,
+# so responsiveness follows how much of the screen changed, not how far the
+# picked colour jumped.
+STICKINESS = 1.5        # score bonus for the current hue (hysteresis)
+CONFIRM_FRAMES = 5      # a new colour must win this many frames in a row...
+SCENE_CUT_MOTION = 0.10  # ...unless the screen changed this much (mean abs pixel diff, 0-1)
 
 PORTAL_BUS = "org.freedesktop.portal.Desktop"
 PORTAL_PATH = "/org/freedesktop/portal/desktop"
@@ -47,17 +56,25 @@ def _systemctl_user(*args):
                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
 
 
-def _smoothing_alpha(diff, dt):
-    """Adaptive EMA factor: calm scenes blend slowly, cuts and flashes snap.
+def _frame_motion(img, prev):
+    """Mean absolute pixel difference between two frames, 0-1."""
+    if prev is None:
+        return 1.0
+    return sum(ImageStat.Stat(ImageChops.difference(img, prev)).mean) / (3 * 255.0)
+
+
+def _smoothing_alpha(motion, dt):
+    """EMA factor: still/small changes blend slowly, scene cuts snap.
 
     Tuned per 60 fps frame; rescaled for the actual tick interval.
     """
-    if diff <= 15:
+    lo, hi = 0.02, 0.15
+    if motion <= lo:
         alpha = 0.08
-    elif diff >= 150:
+    elif motion >= hi:
         alpha = 0.85
     else:
-        alpha = 0.08 + (diff - 15) * (0.85 - 0.08) / (150 - 15)
+        alpha = 0.08 + (motion - lo) * (0.85 - 0.08) / (hi - lo)
     return 1.0 - (1.0 - alpha) ** (dt * 60.0)
 
 
@@ -77,7 +94,14 @@ class Ambience:
         self.pipeline = None
         self._lock = threading.Lock()
         self._target = None         # latest LED colour computed by the streaming thread
+        self._motion = 0.0          # largest frame motion since the last tick
         self._last_analysis = 0.0
+        # streaming-thread state for the colour debounce
+        self._prev_frame = None
+        self._hue = None            # hue of the committed colour (None = neutral)
+        self._committed = None      # (lab, scene_l) currently targeted
+        self._challenger = None     # hue trying to replace it
+        self._challenger_frames = 0
         self._current = None        # smoothed float RGB shown on the keyboard
         self._last_tick = time.monotonic()
 
@@ -198,24 +222,51 @@ class Ambience:
             buf.unmap(info)
         stride = len(frame) // height
         img = Image.frombuffer("RGB", (width, height), frame, "raw", "RGB", stride, 1)
-        rgb = led_rgb(*analyze_image(img), self.cfg)
+        motion = _frame_motion(img, self._prev_frame)
+        self._prev_frame = img
+        rgb = led_rgb(*self._debounced_analysis(img, motion), self.cfg)
         with self._lock:
             self._target = rgb
+            self._motion = max(self._motion, motion)
         return Gst.FlowReturn.OK
+
+    def _debounced_analysis(self, img, motion):
+        """Analyse a frame, switching colour only once the change is confirmed.
+
+        A small element can win or vanish from the palette on alternate frames
+        as it moves across the 64x36 sampling grid; only a hue (or neutral)
+        that keeps winning for CONFIRM_FRAMES frames, or a scene cut, replaces
+        the current colour. Shade changes within the current hue apply at once.
+        """
+        cut = motion >= SCENE_CUT_MOTION or self._committed is None
+        analysis = analyze_image(img, prefer_hue=None if cut else self._hue, stickiness=STICKINESS)
+        hue = accent_hue(analysis[0])
+        if cut or same_hue(hue, self._hue):
+            self._challenger_frames = 0
+        else:
+            if self._challenger_frames and same_hue(hue, self._challenger):
+                self._challenger_frames += 1
+            else:
+                self._challenger, self._challenger_frames = hue, 1
+            if self._challenger_frames < CONFIRM_FRAMES:
+                return self._committed
+            self._challenger_frames = 0
+        self._hue, self._committed = hue, analysis
+        return analysis
 
     def _tick(self):
         # Main thread: smooth toward the latest target and write only on change.
         now = time.monotonic()
         dt, self._last_tick = now - self._last_tick, now
         with self._lock:
-            target = self._target
+            target, motion = self._target, self._motion
+            self._motion = 0.0
         if target is None:
             return True
         if self._current is None:
             self._current = list(target)
         else:
-            diff = sum((c - t) ** 2 for c, t in zip(self._current, target)) ** 0.5
-            alpha = _smoothing_alpha(diff, dt)
+            alpha = _smoothing_alpha(motion, dt)
             self._current = [c + (t - c) * alpha for c, t in zip(self._current, target)]
         self.kbd.set_rgb(tuple(round(c) for c in self._current), persist=False)
         return True

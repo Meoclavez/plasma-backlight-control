@@ -203,8 +203,12 @@ def load_thumbnail(path, crop_aspect=None):
     return thumb if thumb.mode == "RGB" else thumb.convert("RGB")
 
 
-def analyze_image(img):
-    """Return ((L, a, b) accent colour in OKLab, area-weighted scene lightness)."""
+def analyze_image(img, prefer_hue=None, stickiness=1.0):
+    """Return ((L, a, b) accent colour in OKLab, area-weighted scene lightness).
+
+    For video, prefer_hue (radians, the previous pick) with stickiness > 1
+    adds hysteresis so near-tied candidates do not swap winner every frame.
+    """
     if img.mode != "RGB":
         img = img.convert("RGB")
     q = img.quantize(colors=PALETTE_SIZE, method=Image.Quantize.MEDIANCUT)
@@ -222,7 +226,10 @@ def analyze_image(img):
         area, L, _, _, chroma, _ = c
         # ignore near-black noise and blown-out highlights
         usable = _smoothstep(0.15, 0.40, L) * (1.0 - _smoothstep(0.90, 0.99, L))
-        return (chroma ** 1.5) * (area ** 0.4) * usable
+        s = (chroma ** 1.5) * (area ** 0.4) * usable
+        if prefer_hue is not None and _hue_distance(c[5], prefer_hue) <= HUE_WINDOW:
+            s *= stickiness
+        return s
 
     best = max(clusters, key=score)
     if best[4] < NEUTRAL_CHROMA or score(best) <= 0.0:
@@ -237,6 +244,18 @@ def analyze_image(img):
     wsum = sum(s for s, _ in family)
     lab = tuple(sum(s * c[i] for s, c in family) / wsum for i in (1, 2, 3))
     return lab, scene_l
+
+
+def accent_hue(lab):
+    """Hue of an analysed accent in radians, or None for a neutral colour."""
+    return math.atan2(lab[2], lab[1]) if math.hypot(lab[1], lab[2]) >= NEUTRAL_CHROMA else None
+
+
+def same_hue(h1, h2):
+    """True if two accent_hue() results describe the same colour state."""
+    if h1 is None or h2 is None:
+        return h1 is None and h2 is None
+    return _hue_distance(h1, h2) <= HUE_WINDOW
 
 
 def led_rgb(lab, scene_l, cfg):
